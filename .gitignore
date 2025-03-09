@@ -1,5 +1,5 @@
 .venv
 output
 data\*
-__pycache__/
-llme_files/
+__pycache__\
+llme_files\
