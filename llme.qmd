@@ -1,0 +1,220 @@
+---
+title: "LM based on Me"
+format:
+  html:
+    code-fold: true
+jupyter: python3
+---
+
+# Setup
+
+```{python}
+import pandas as pd
+import sys
+import regex as re
+
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
+from pathlib import Path
+from typing import Optional, Tuple
+
+
+```
+
+```{python}
+torch.manual_seed(36432)
+```
+
+# Data Preparation
+
+## Importing
+```{python}
+def read_document(filepath: str) -> pd.DataFrame:
+
+    # put any filters here
+
+    lines = []
+    with open(filepath, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    filtered_lines = []
+    for line in lines:
+        if (
+            "ENTRY" not in line and
+            "CHAPTER" not in line
+        ):
+            filtered_lines.append(line)
+
+    df = pd.DataFrame(filtered_lines)
+
+    return df
+```
+
+```{python}
+all_stories = {}
+data_directory = Path("./data")
+
+for file in data_directory.glob("*.txt"):
+    filename = file.stem
+    all_stories[filename] = read_document(file)
+
+all_stories[filename].head()
+```
+
+With this simple code snippet, we are able to import as many text files
+as we want from our data directory, filter out lines as necessary, and
+convert them into a DataFrame.
+
+## Tokenizing the text
+
+This implementation will focus on using Byte Pair Encoding tokenization,
+which encodes a fixed size of tokens.
+It is a healthy balance between simply tokenizing per character, or
+tokenizing per word, which in either case may yield too little or too
+many tokens.
+
+```{python}
+text_sequence = ""
+for story in all_stories.keys():
+    text_sequence += " ".join(all_stories[story][0].values)
+
+print(f"size of text_sequence: {len(text_sequence)}")
+```
+
+```{python}
+sys.path.append('./lib')
+from minbpe import BasicTokenizer
+
+tokenizer = BasicTokenizer()
+tokenizer.train(text_sequence, vocab_size=1024)
+```
+
+Taking a look at the token sequences now:
+```{python}
+vocab = tokenizer.vocab
+
+vocab
+```
+
+```{python}
+tokenizer.encode("What the")
+```
+
+```{python}
+tokenizer.decode([120, 543, 222, 76])
+```
+
+Looking pretty spicy.
+
+Let's also append some special tokens to the vocab.
+
+This will be useful for training later on.
+
+```{python}
+max_vocab_id = list(vocab.keys())[-1]
+tokenizer.special_tokens = {
+    max_vocab_id + 1: "<<startoftext>>",
+    max_vocab_id + 2: "<<separator>>",
+    max_vocab_id + 3: "<<endoftext>>",
+    max_vocab_id + 4: "<<unk>>"
+}
+```
+
+```{python}
+len(tokenizer.encode(text_sequence))
+```
+
+```{python}
+tokenizer.save(file_prefix="./output/tokenizer/da_tokenizer")
+```
+
+## Transformer Model
+
+We will need both an encoder and a decoder.
+
+A decoder will consist of the following components:
+- token embedding (represent a token with a vector)
+- positional encoding (preserving token orders)
+- self attention (keep track of relation between tokens)
+- residual connections
+- layer normalization
+
+Parameters of a decoder:
+- block size
+- embedding size
+- number of heads & head size
+- number of blocks (layers)
+
+```{python}
+def get_vocab_size(tokenizer: BasicTokenizer) -> int:
+    vocab = tokenizer.vocab
+    special_tokens = tokenizer.special_tokens
+
+    return len(vocab) + len(special_tokens)
+```
+
+```{python}
+# hyperparameters
+block_size = 256
+embed_size = 384
+head_count = 6
+layer_count = 6
+dropout = 0.2
+vocab_size = get_vocab_size(tokenizer)
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+```
+
+```{python}
+class Head(nn.Module):
+    def __init__(self, head_size: int) -> None:
+        super().__init__()
+
+        self.key = nn.Linear(embed_size, head_size, bias=False)
+        self.query = nn.Linear(embed_size, head_size, bias=False)
+        self.value = nn.Linear(embed_size, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(
+            torch.ones(block_size, block_size))
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        input size (batch, time-step, channels)
+        output size (batch, time-step, head size)
+        """
+
+        _, T, _ = x.shape
+
+        k = self.key(x) # (B, T, hs)
+        q = self.query(x) # (B, T, hs)
+
+        # compute attention scores (or "affinities")
+        # (B, T, hs) @ (B, hs, T) -> (B, T, T)
+        weights = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5
+        weights = weights.masked_fill(
+            self.tril[:T, :T] == 0, float('-inf'))
+
+        weights = F.softmax(weights, dim=-1)
+        weights = self.dropout(weights)
+
+        # perform weighted aggregation of values
+        v = self.value(x)
+        out = weights @ v
+        return out
+```
+
+```{python}
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_head: int, head_size: int) -> None:
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.projection = nn.Linear(head_size + num_heads, embed_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.projection(out))
+        return out
+```
