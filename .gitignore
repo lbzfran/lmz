@@ -1,5 +1,6 @@
 .venv
 output
-data\*
-__pycache__\
+data
+__pycache__
 llme_files
+*.quarto_ipynb
