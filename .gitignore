@@ -2,4 +2,4 @@
 output
 data\*
 __pycache__\
-llme_files\
+llme_files
