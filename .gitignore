@@ -4,3 +4,4 @@ data/*
 __pycache__
 llme_files
 *.quarto_ipynb
+.ipynb_checkpoints
