@@ -16,11 +16,12 @@ import regex as re
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.utils.data import Dataset, DataLoader
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
-
+import matplotlib.pyplot as plt
 ```
 
 ```{python}
@@ -86,6 +87,7 @@ print(f"size of text_sequence: {len(text_sequence)}")
 ```{python}
 sys.path.append('./lib')
 from minbpe import BasicTokenizer
+from transformer.model import GPTLanguageModel
 
 tokenizer = BasicTokenizer()
 tokenizer.train(text_sequence, vocab_size=1024)
@@ -95,7 +97,7 @@ Taking a look at the token sequences now:
 ```{python}
 vocab = tokenizer.vocab
 
-vocab
+print(vocab)
 ```
 
 ```{python}
@@ -135,11 +137,11 @@ tokenizer.save(file_prefix="./output/tokenizer/da_tokenizer")
 We will need both an encoder and a decoder.
 
 A decoder will consist of the following components:
-- token embedding (represent a token with a vector)
-- positional encoding (preserving token orders)
-- self attention (keep track of relation between tokens)
-- residual connections
-- layer normalization
+    - token embedding (represent a token with a vector)
+    - positional encoding (preserving token orders)
+    - self attention (keep track of relation between tokens)
+    - residual connections
+    - layer normalization
 
 Parameters of a decoder:
 - block size
@@ -153,68 +155,222 @@ def get_vocab_size(tokenizer: BasicTokenizer) -> int:
     special_tokens = tokenizer.special_tokens
 
     return len(vocab) + len(special_tokens)
+
+def print_model_structure(model: torch.nn.Module, indent: str = '') -> None:
+    for name, child in model.named_children():
+        params = sum(p.numel() for p in child.parameters())
+        print(f"{indent}|-- {name}: {child.__class__.__name__} ({params:,} parameters)")
+        print_model_structure(child, indent + '|    ')
 ```
 
 ```{python}
 # hyperparameters
-block_size = 256
-embed_size = 384
-head_count = 6
-layer_count = 6
+blockSize = 256
+embedSize = 384
+headCount = 6
+layerCount = 6
 dropout = 0.2
-vocab_size = get_vocab_size(tokenizer)
+batchSize = 128
+vocabSize = get_vocab_size(tokenizer)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 ```
 
 ```{python}
-class Head(nn.Module):
-    def __init__(self, head_size: int) -> None:
-        super().__init__()
+model = GPTLanguageModel(
+    vocab_size=vocabSize,
+    block_size=blockSize,
+    n_embd=embedSize,
+    n_head=headCount,
+    n_layer=layerCount,
+    dropout=dropout,
+    device=device
+).to(device)
 
-        self.key = nn.Linear(embed_size, head_size, bias=False)
-        self.query = nn.Linear(embed_size, head_size, bias=False)
-        self.value = nn.Linear(embed_size, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(
-            torch.ones(block_size, block_size))
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        input size (batch, time-step, channels)
-        output size (batch, time-step, head size)
-        """
-
-        _, T, _ = x.shape
-
-        k = self.key(x) # (B, T, hs)
-        q = self.query(x) # (B, T, hs)
-
-        # compute attention scores (or "affinities")
-        # (B, T, hs) @ (B, hs, T) -> (B, T, T)
-        weights = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5
-        weights = weights.masked_fill(
-            self.tril[:T, :T] == 0, float('-inf'))
-
-        weights = F.softmax(weights, dim=-1)
-        weights = self.dropout(weights)
-
-        # perform weighted aggregation of values
-        v = self.value(x)
-        out = weights @ v
-        return out
+print(sum(p.numel() for p in model.parameters())/1e6, 'M params')
 ```
 
 ```{python}
-class MultiHeadAttention(nn.Module):
-    def __init__(self, num_head: int, head_size: int) -> None:
-        super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.projection = nn.Linear(head_size + num_heads, embed_size)
-        self.dropout = nn.Dropout(dropout)
+#print_model_structure(model)
+```
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.projection(out))
-        return out
+# Pre-Training
+
+```{python}
+encoded_text_sequence = tokenizer.encode(text_sequence)
+len(encoded_text_sequence)
+```
+
+```{python}
+data = torch.tensor(encoded_text_sequence, dtype=torch.long)
+split_index = int(0.9 * len(data))
+train_data = data[:split_index]
+val_data = data[split_index:]
+```
+
+```{python}
+class TextDataset(Dataset):
+    def __init__(self, data: torch.Tensor, block_size: int) -> None:
+        self.data = data
+        self.block_size = block_size
+
+    def __len__(self) -> int:
+        return len(self.data) - self.block_size
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.data[index:index + self.block_size]
+        y = self.data[index + 1:index + self.block_size + 1]
+
+        return x, y
+
+def get_dataloaders(
+    train_data: torch.Tensor,
+    val_data: torch.Tensor,
+    block_size: int,
+    batch_size: int,
+    device: torch.device
+) -> Tuple[DataLoader, DataLoader]:
+    train_dataset = TextDataset(train_data.to(device), block_size)
+    val_dataset = TextDataset(val_data.to(device), block_size)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True
+    )
+
+    val_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=False
+    )
+
+    return train_loader, val_loader
+```
+
+```{python}
+train_loader, val_loader = get_dataloaders(
+    train_data=train_data,
+    val_data=val_data,
+    block_size=blockSize,
+    batch_size=batchSize,
+    device=device
+)
+
+x, y = next(iter(train_loader))
+x.shape, y.shape
+
+```
+
+```{python}
+
+@torch.no_grad()
+def estimate_loss(
+    model: torch.nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    eval_iters: int
+) -> Dict[str, float]:
+    output = {}
+    model.eval()
+
+    for split, loader in [('train', train_loader), ('val', val_loader)]:
+        losses = torch.zeros(eval_iters)
+        for i, (x, y) in enumerate(loader):
+            if i >= eval_iters:
+                break
+            with torch.no_grad():
+                _, loss = model(x, y)
+            losses[i] = loss.item()
+        output[split] = losses.mean().item()
+
+    model.train()
+    return output
+
+def save_checkpoint(
+    model: GPTLanguageModel,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    loss: float,
+    filename: str = "checkpoint.pth"
+) -> None:
+    checkpoint = {
+        'epoch' : epoch,
+        'model_state_dict' : model.state_dict(),
+        'optimizer_state_dict' : optimizer.state_dict(),
+        'loss' : loss
+    }
+
+    torch.save(checkpoint, filename)
+```
+
+# Training
+
+```{python}
+"""
+max_iters = 2
+eval_interval = 10
+eval_iters = 200
+learning_rate = 1e-4
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+train_loader, val_loader = get_dataloaders(
+    train_data=train_data,
+    val_data=val_data,
+    block_size=blockSize,
+    batch_size=batchSize,
+    device=device
+)
+
+train_losses = []
+val_losses = []
+
+for iteration in range(max_iters):
+    for batch_idx, (x_batch, y_batch) in enumerate(train_loader):
+        if batch_idx % eval_interval == 0 or batch_idx == len(train_loader) - 1:
+            losses = estimate_loss(
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                eval_iters=min(eval_iters, len(val_loader))
+            )
+
+            train_losses.append(losses['train'])
+            val_losses.append(losses['val'])
+
+            print(
+                f"iteration {iteration} / step {batch_idx}: "
+                f"train loss {losses['train']:.4f}, "
+                f"val loss {losses['val']:.4f}"
+            )
+
+            logits, loss = model(x_batch, y_batch)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+        save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            epoch=iteration,
+            loss=loss.item(),
+            filename=f"./output/pre_training/checkpoint_{iteration}.pth"
+        )
+"""
+```
+
+```{python}
+"""
+plt.figure(figsize=(10, 5))
+
+plt.plot(train_losses, label="Train Loss")
+plt.plot(val_losses, label="Validation Loss")
+plt.xlabel("Eval Step")
+plt.ylim(0)
+plt.ylabel("Loss")
+plt.title("Training and Eval Loss Over Time")
+plt.legend()
+plt.grid()
+plt.show()
+"""
 ```
